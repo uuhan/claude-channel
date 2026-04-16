@@ -15,6 +15,7 @@ const DEFAULT_API_KEY = process.env.BRIDGE_API_KEY?.trim() || "";
 const AUTO_START_HTTP = process.env.BRIDGE_HTTP_AUTO_START === "1";
 const DEFAULT_MODEL_ID = "claude-channel";
 const DEFAULT_MODEL_CREATED_AT = 0;
+const CHANNEL_DEBUG_MAX_EVENTS = parseInt(process.env.BRIDGE_CHANNEL_DEBUG_MAX_EVENTS || "500", 10);
 const MODEL_CATALOG = [
   {
     id: DEFAULT_MODEL_ID,
@@ -42,6 +43,12 @@ const ChannelPublishSchema = z.object({
   content: z.string().min(1),
   meta: z.record(z.string(), z.string()).optional(),
 });
+
+const ChannelDebugEventsSchema = z
+  .object({
+    limit: z.number().int().min(1).max(500).optional(),
+  })
+  .optional();
 
 type Role = "system" | "user" | "assistant" | "tool";
 
@@ -73,8 +80,18 @@ type OpenAIServerState = {
   api_key_enabled: boolean;
 };
 
+type ChannelEventRecord = {
+  event_id: number;
+  ts: string;
+  kind: "request" | "publish";
+  content: string;
+  meta: Record<string, string>;
+};
+
 class ClaudeChannelBridge {
   private readonly pending = new Map<string, PendingReply>();
+  private readonly channelEvents: ChannelEventRecord[] = [];
+  private nextEventId = 1;
 
   constructor(
     private readonly server: MCPServer,
@@ -110,6 +127,7 @@ class ClaudeChannelBridge {
       request_id: requestId,
       ...input.meta,
     });
+    this.recordChannelEvent("request", input.content, meta);
 
     try {
       await this.server.notification({
@@ -134,11 +152,13 @@ class ClaudeChannelBridge {
   }
 
   async publish(input: { content: string; meta?: Record<string, string> }) {
+    const meta = sanitizeMeta(input.meta || {});
+    this.recordChannelEvent("publish", input.content, meta);
     await this.server.notification({
       method: "notifications/claude/channel",
       params: {
         content: input.content,
-        meta: sanitizeMeta(input.meta || {}),
+        meta,
       },
     });
   }
@@ -165,6 +185,38 @@ class ClaudeChannelBridge {
 
   pendingCount() {
     return this.pending.size;
+  }
+
+  getChannelEvents(limit?: number) {
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) {
+      return [...this.channelEvents];
+    }
+    return this.channelEvents.slice(-Math.floor(limit));
+  }
+
+  channelEventCount() {
+    return this.channelEvents.length;
+  }
+
+  private recordChannelEvent(
+    kind: ChannelEventRecord["kind"],
+    content: string,
+    meta: Record<string, string>,
+  ) {
+    this.channelEvents.push({
+      event_id: this.nextEventId++,
+      ts: new Date().toISOString(),
+      kind,
+      content,
+      meta,
+    });
+
+    const maxEvents = Number.isFinite(CHANNEL_DEBUG_MAX_EVENTS) && CHANNEL_DEBUG_MAX_EVENTS > 0
+      ? CHANNEL_DEBUG_MAX_EVENTS
+      : 500;
+    while (this.channelEvents.length > maxEvents) {
+      this.channelEvents.shift();
+    }
   }
 
   cancelAll(reason: string) {
@@ -663,6 +715,10 @@ function getRuntimeStatus() {
     },
     channel: {
       pending_requests: bridge.pendingCount(),
+      total_events: bridge.channelEventCount(),
+      max_events: Number.isFinite(CHANNEL_DEBUG_MAX_EVENTS) && CHANNEL_DEBUG_MAX_EVENTS > 0
+        ? CHANNEL_DEBUG_MAX_EVENTS
+        : 500,
     },
   };
 }
@@ -711,6 +767,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "channel_debug_events",
+      description: "Debug tool: list channel messages that were sent into Claude channels.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "integer",
+            minimum: 1,
+            maximum: 500,
+            description: "Optional max number of latest events to return.",
+          },
+        },
         additionalProperties: false,
       },
     },
@@ -801,6 +873,26 @@ server.setRequestHandler(
           },
         ],
         structuredContent: status,
+      };
+    }
+
+    if (name === "channel_debug_events") {
+      const args = ChannelDebugEventsSchema.parse(request.params.arguments);
+      const events = bridge.getChannelEvents(args?.limit);
+      const result = {
+        count: events.length,
+        pending_requests: bridge.pendingCount(),
+        events,
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+        structuredContent: result,
       };
     }
 

@@ -88,6 +88,7 @@ bun run src/index.ts
 - `http_server_stop`：停止 HTTP 服务
 - `http_server_status`：查看服务状态
 - `runtime_status`：查看 MCP 运行状态（含监听 host/port、listen_url、pending 请求数、OpenAI routes 和模型列表）
+- `channel_debug_events`：调试查看进入 channels 的消息内容和 meta（支持 `limit`）
 - `channel_reply`：Claude Code 用它回复某个 `request_id`
 - `channel_publish`：手动发送测试 channel
 
