@@ -13,6 +13,16 @@ const DEFAULT_HTTP_PORT = parseInt(process.env.BRIDGE_HTTP_PORT || "8787", 10);
 const DEFAULT_CHAT_TIMEOUT_MS = parseInt(process.env.BRIDGE_CHAT_TIMEOUT_MS || "180000", 10);
 const DEFAULT_API_KEY = process.env.BRIDGE_API_KEY?.trim() || "";
 const AUTO_START_HTTP = process.env.BRIDGE_HTTP_AUTO_START === "1";
+const DEFAULT_MODEL_ID = "claude-channel";
+const DEFAULT_MODEL_CREATED_AT = 0;
+const MODEL_CATALOG = [
+  {
+    id: DEFAULT_MODEL_ID,
+    object: "model",
+    created: DEFAULT_MODEL_CREATED_AT,
+    owned_by: "claude-channel",
+  },
+] as const;
 
 const StartHttpServerSchema = z
   .object({
@@ -258,6 +268,26 @@ class OpenAICompatServer {
       return;
     }
 
+    if (url.pathname === "/v1/models") {
+      if (req.method !== "GET") {
+        sendJSON(res, 405, {
+          error: {
+            type: "method_not_allowed",
+            message: "Use GET /v1/models",
+            code: "method_not_allowed",
+          },
+        });
+        return;
+      }
+
+      if (!this.checkApiKey(req, res)) {
+        return;
+      }
+
+      sendJSON(res, 200, buildModelListResponse());
+      return;
+    }
+
     if (url.pathname !== "/v1/chat/completions") {
       sendJSON(res, 404, {
         error: {
@@ -280,19 +310,8 @@ class OpenAICompatServer {
       return;
     }
 
-    if (this.apiKey) {
-      const authorization = req.headers.authorization ?? "";
-      const expected = `Bearer ${this.apiKey}`;
-      if (authorization !== expected) {
-        sendJSON(res, 401, {
-          error: {
-            type: "invalid_api_key",
-            message: "Missing or invalid Bearer API key",
-            code: "invalid_api_key",
-          },
-        });
-        return;
-      }
+    if (!this.checkApiKey(req, res)) {
+      return;
     }
 
     let body: unknown;
@@ -322,7 +341,7 @@ class OpenAICompatServer {
     }
 
     const request = parsed.value;
-    const model = request.model || "claude-channel-bridge";
+    const model = request.model || DEFAULT_MODEL_ID;
     const created = Math.floor(Date.now() / 1000);
     const channelContent = buildChannelContent(request.messages);
 
@@ -384,6 +403,34 @@ class OpenAICompatServer {
       },
     });
   }
+
+  private checkApiKey(req: IncomingMessage, res: ServerResponse<IncomingMessage>) {
+    if (!this.apiKey) {
+      return true;
+    }
+
+    const authorization = req.headers.authorization ?? "";
+    const expected = `Bearer ${this.apiKey}`;
+    if (authorization === expected) {
+      return true;
+    }
+
+    sendJSON(res, 401, {
+      error: {
+        type: "invalid_api_key",
+        message: "Missing or invalid Bearer API key",
+        code: "invalid_api_key",
+      },
+    });
+    return false;
+  }
+}
+
+function buildModelListResponse() {
+  return {
+    object: "list",
+    data: MODEL_CATALOG,
+  };
 }
 
 function parseChatCompletionRequest(input: unknown):
@@ -595,6 +642,31 @@ const server = new MCPServer(
 const bridge = new ClaudeChannelBridge(server, DEFAULT_CHAT_TIMEOUT_MS);
 const openaiServer = new OpenAICompatServer(bridge);
 
+function getRuntimeStatus() {
+  const http = openaiServer.getState();
+  return {
+    service: "claude-channel",
+    now: new Date().toISOString(),
+    mcp: {
+      connected: true,
+      transport: "stdio",
+      pid: process.pid,
+      uptime_seconds: Math.floor(process.uptime()),
+    },
+    http: {
+      ...http,
+      listen_url: http.running ? `http://${http.host}:${http.port}` : undefined,
+    },
+    openai_api: {
+      routes: ["/health", "/v1/models", "/v1/chat/completions"],
+      models: MODEL_CATALOG,
+    },
+    channel: {
+      pending_requests: bridge.pendingCount(),
+    },
+  };
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -626,6 +698,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "http_server_status",
       description: "Get OpenAI-compatible HTTP API service status.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "runtime_status",
+      description:
+        "Get runtime status of this MCP service, including OpenAI HTTP listen address/port and channel queue.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -698,6 +780,19 @@ server.setRequestHandler(
 
     if (name === "http_server_status") {
       const status = openaiServer.getState();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(status),
+          },
+        ],
+        structuredContent: status,
+      };
+    }
+
+    if (name === "runtime_status") {
+      const status = getRuntimeStatus();
       return {
         content: [
           {
