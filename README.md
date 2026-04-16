@@ -12,6 +12,47 @@
   2. Claude Code 调用 `channel_reply` 返回内容
   3. MCP 服务把结果封装成 OpenAI Chat Completions 响应返回
 
+## 整体调用流程图
+
+### 架构视图
+
+```mermaid
+flowchart LR
+    App[其他应用]
+    API[OpenAI Compatible API<br/>/v1/chat/completions<br/>/v1/models]
+    MCP[claude-channel MCP Server<br/>stdio + channel bridge]
+    Claude[Claude Code]
+
+    App --> API
+    API --> MCP
+    MCP --> Claude
+    Claude --> MCP
+    MCP --> API
+    API --> App
+```
+
+### 时序视图
+
+```mermaid
+sequenceDiagram
+    participant App as 其他应用
+    participant API as claude-channel HTTP API
+    participant MCP as claude-channel MCP (stdio)
+    participant Claude as Claude Code
+
+    Claude->>MCP: 启动并接入 MCP
+    Claude->>MCP: http_server_start (或 BRIDGE_HTTP_AUTO_START=1)
+    App->>API: POST /v1/chat/completions
+    API->>MCP: 创建 pending request_id
+    MCP-->>Claude: notifications/claude/channel<br/><channel source=claude-channel ...>
+    Claude->>MCP: 调用 channel_reply(request_id, content)
+    MCP->>API: 匹配 request_id，回填回复
+    API-->>App: OpenAI Chat Completions 响应
+
+    App->>API: GET /v1/models
+    API-->>App: 模型列表 (claude-channel)
+```
+
 ## 安装
 
 ```bash
