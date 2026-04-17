@@ -8,7 +8,8 @@
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
     "typecheck": "bunx tsc --noEmit",
-    "build": "mkdir -p dist && bun build --compile src/index.ts --outfile dist/claude-channel"
+    "build": "mkdir -p dist && bun build --compile src/index.ts --outfile dist/claude-channel",
+    "build:linux-amd64": "mkdir -p dist && bun build --compile --target=bun-linux-x64 src/index.ts --outfile dist/claude-channel-linux-amd64"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
