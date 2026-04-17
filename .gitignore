@@ -1,2 +1,8 @@
 node_modules
 dist
+._*
+.DS_Store
+*.log
+coverage/
+.env
+.env.local

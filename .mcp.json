@@ -5,7 +5,7 @@
       "args": ["run", "src/index.ts"],
       "env": {
         "BRIDGE_HTTP_AUTO_START": "1",
-        "BRIDGE_HTTP_HOST": "127.0.0.1",
+        "BRIDGE_HTTP_HOST": "0.0.0.0",
         "BRIDGE_HTTP_PORT": "8787",
         "BRIDGE_STREAM_EMIT_CHUNK_SIZE": "3",
         "BRIDGE_STREAM_EMIT_INTERVAL_MS": "28",
