@@ -135,7 +135,7 @@ curl -N -X POST http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
-提示：如果上游一次回传整段 `delta`，可通过 `BRIDGE_STREAM_EMIT_CHUNK_SIZE` 和 `BRIDGE_STREAM_EMIT_INTERVAL_MS` 在服务端二次切片，前端会看到更连续的流式输出。
+提示：如果上游一次回传整段 `delta`，可通过 `BRIDGE_STREAM_EMIT_CHUNK_SIZE`、`BRIDGE_STREAM_EMIT_INTERVAL_MS`、`BRIDGE_STREAM_EMIT_PUNCT_PAUSE_MS` 在服务端二次切片，前端会看到更连续、更接近打字机的流式输出。
 
 ### 开启 API Key 校验
 
@@ -158,8 +158,9 @@ export BRIDGE_API_KEY='your-token'
 - `BRIDGE_CHAT_TIMEOUT_MS`：默认 `180000`
 - `BRIDGE_API_KEY`：可选，设置后启用 Bearer 校验
 - `BRIDGE_HTTP_AUTO_START=1`：MCP 连接后自动启动 HTTP 服务
-- `BRIDGE_STREAM_EMIT_CHUNK_SIZE`：stream 输出切片大小（按字符切分，默认 `24`）
-- `BRIDGE_STREAM_EMIT_INTERVAL_MS`：stream 每个切片之间的间隔毫秒（默认 `0`，可设 `10-40` 提升“逐字感”）
+- `BRIDGE_STREAM_EMIT_CHUNK_SIZE`：stream 输出切片大小（按字符切分，默认 `3`）
+- `BRIDGE_STREAM_EMIT_INTERVAL_MS`：stream 每个切片之间的基础间隔毫秒（默认 `28`）
+- `BRIDGE_STREAM_EMIT_PUNCT_PAUSE_MS`：遇到句号/问号/叹号等标点时的额外停顿（默认 `90`）
 
 ## 交互约定
 

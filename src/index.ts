@@ -16,8 +16,9 @@ const AUTO_START_HTTP = process.env.BRIDGE_HTTP_AUTO_START === "1";
 const DEFAULT_MODEL_ID = "claude-channel";
 const DEFAULT_MODEL_CREATED_AT = 0;
 const CHANNEL_DEBUG_MAX_EVENTS = parseInt(process.env.BRIDGE_CHANNEL_DEBUG_MAX_EVENTS || "500", 10);
-const STREAM_EMIT_CHUNK_SIZE = parseInt(process.env.BRIDGE_STREAM_EMIT_CHUNK_SIZE || "24", 10);
-const STREAM_EMIT_INTERVAL_MS = parseInt(process.env.BRIDGE_STREAM_EMIT_INTERVAL_MS || "0", 10);
+const STREAM_EMIT_CHUNK_SIZE = parseInt(process.env.BRIDGE_STREAM_EMIT_CHUNK_SIZE || "3", 10);
+const STREAM_EMIT_INTERVAL_MS = parseInt(process.env.BRIDGE_STREAM_EMIT_INTERVAL_MS || "28", 10);
+const STREAM_EMIT_PUNCT_PAUSE_MS = parseInt(process.env.BRIDGE_STREAM_EMIT_PUNCT_PAUSE_MS || "90", 10);
 const MODEL_CATALOG = [
   {
     id: DEFAULT_MODEL_ID,
@@ -636,6 +637,7 @@ class OpenAICompatServer {
     let errorAfterDrain: Error | null = null;
     const chunkSize = streamEmitChunkSize();
     const emitIntervalMs = streamEmitIntervalMs();
+    const punctPauseMs = streamEmitPunctPauseMs();
 
     const writeDeltaChunk = (delta: Record<string, unknown>, finishReason: string | null) => {
       if (streamClosed || streamFinished || res.writableEnded) {
@@ -711,8 +713,9 @@ class OpenAICompatServer {
             continue;
           }
           writeDeltaChunk({ content: delta }, null);
-          if (emitIntervalMs > 0) {
-            await sleep(emitIntervalMs);
+          const delayMs = emitIntervalMs + streamChunkExtraPause(delta, punctPauseMs);
+          if (delayMs > 0) {
+            await sleep(delayMs);
           }
         }
       } finally {
@@ -946,7 +949,7 @@ function buildChannelContent(messages: OpenAIMessage[], stream: boolean) {
   lines.push("");
   if (stream) {
     lines.push(
-      "当前请求为 stream=true。请优先调用 channel_reply_stream 工具分段返回：建议边生成边发送，单次 delta 尽量短（约 10-40 字），可多次发送，最后 done=true。若只返回一次，也可用 channel_reply。",
+      "当前请求为 stream=true。请优先一次性或较大块返回内容（例如每次 80-200 字，或直接整段）。可用 channel_reply_stream 多次发送 delta，最后 done=true；也可以直接用 channel_reply 返回全文。claude-channel 会在服务端自动按打字机效果切片输出。",
     );
   } else {
     lines.push("请直接给出你要返回给 API 调用方的最终回复内容。然后调用 channel_reply 工具，带上 request_id。");
@@ -1022,6 +1025,38 @@ function streamEmitIntervalMs() {
     return 0;
   }
   return Math.floor(STREAM_EMIT_INTERVAL_MS);
+}
+
+function streamEmitPunctPauseMs() {
+  if (!Number.isFinite(STREAM_EMIT_PUNCT_PAUSE_MS) || STREAM_EMIT_PUNCT_PAUSE_MS < 0) {
+    return 0;
+  }
+  return Math.floor(STREAM_EMIT_PUNCT_PAUSE_MS);
+}
+
+function streamChunkExtraPause(chunk: string, punctPauseMs: number) {
+  if (punctPauseMs <= 0) {
+    return 0;
+  }
+
+  const trimmed = chunk.trimEnd();
+  if (!trimmed) {
+    return 0;
+  }
+
+  if (trimmed.endsWith("\n")) {
+    return punctPauseMs;
+  }
+
+  if (/[，、,]$/.test(trimmed)) {
+    return Math.floor(punctPauseMs * 0.5);
+  }
+
+  if (/[。！？.!?；;：:]$/.test(trimmed)) {
+    return punctPauseMs;
+  }
+
+  return 0;
 }
 
 function sleep(ms: number) {
@@ -1122,6 +1157,7 @@ function getRuntimeStatus() {
       models: MODEL_CATALOG,
       stream_emit_chunk_size: streamEmitChunkSize(),
       stream_emit_interval_ms: streamEmitIntervalMs(),
+      stream_emit_punct_pause_ms: streamEmitPunctPauseMs(),
     },
     channel: {
       pending_requests: bridge.pendingCount(),
