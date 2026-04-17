@@ -16,6 +16,8 @@ const AUTO_START_HTTP = process.env.BRIDGE_HTTP_AUTO_START === "1";
 const DEFAULT_MODEL_ID = "claude-channel";
 const DEFAULT_MODEL_CREATED_AT = 0;
 const CHANNEL_DEBUG_MAX_EVENTS = parseInt(process.env.BRIDGE_CHANNEL_DEBUG_MAX_EVENTS || "500", 10);
+const STREAM_EMIT_CHUNK_SIZE = parseInt(process.env.BRIDGE_STREAM_EMIT_CHUNK_SIZE || "24", 10);
+const STREAM_EMIT_INTERVAL_MS = parseInt(process.env.BRIDGE_STREAM_EMIT_INTERVAL_MS || "0", 10);
 const MODEL_CATALOG = [
   {
     id: DEFAULT_MODEL_ID,
@@ -628,6 +630,12 @@ class OpenAICompatServer {
     const bufferedDeltas: string[] = [];
     let bufferedDone = false;
     let bufferedError: Error | null = null;
+    const deltaQueue: string[] = [];
+    let drainingQueue = false;
+    let doneAfterDrain = false;
+    let errorAfterDrain: Error | null = null;
+    const chunkSize = streamEmitChunkSize();
+    const emitIntervalMs = streamEmitIntervalMs();
 
     const writeDeltaChunk = (delta: Record<string, unknown>, finishReason: string | null) => {
       if (streamClosed || streamFinished || res.writableEnded) {
@@ -676,6 +684,58 @@ class OpenAICompatServer {
       res.end();
     };
 
+    const enqueueDelta = (delta: string) => {
+      if (!delta) {
+        return;
+      }
+      const chunks = splitTextForStreaming(delta, chunkSize);
+      for (const chunk of chunks) {
+        deltaQueue.push(chunk);
+      }
+      void drainQueue();
+    };
+
+    const drainQueue = async () => {
+      if (drainingQueue || streamClosed || streamFinished || res.writableEnded) {
+        return;
+      }
+      drainingQueue = true;
+      try {
+        while (deltaQueue.length > 0) {
+          if (streamClosed || streamFinished || res.writableEnded) {
+            deltaQueue.length = 0;
+            return;
+          }
+          const delta = deltaQueue.shift();
+          if (!delta) {
+            continue;
+          }
+          writeDeltaChunk({ content: delta }, null);
+          if (emitIntervalMs > 0) {
+            await sleep(emitIntervalMs);
+          }
+        }
+      } finally {
+        drainingQueue = false;
+      }
+
+      if (streamClosed || streamFinished || res.writableEnded) {
+        return;
+      }
+
+      if (errorAfterDrain) {
+        const error = errorAfterDrain;
+        errorAfterDrain = null;
+        failStream(error);
+        return;
+      }
+
+      if (doneAfterDrain) {
+        doneAfterDrain = false;
+        finishStream();
+      }
+    };
+
     const flushBufferedEvents = () => {
       if (!streamOpened || streamClosed || streamFinished || res.writableEnded) {
         return;
@@ -684,20 +744,28 @@ class OpenAICompatServer {
       while (bufferedDeltas.length > 0) {
         const delta = bufferedDeltas.shift();
         if (typeof delta === "string" && delta.length > 0) {
-          writeDeltaChunk({ content: delta }, null);
+          enqueueDelta(delta);
         }
       }
 
       if (bufferedError) {
         const error = bufferedError;
         bufferedError = null;
-        failStream(error);
+        if (drainingQueue || deltaQueue.length > 0) {
+          errorAfterDrain = error;
+        } else {
+          failStream(error);
+        }
         return;
       }
 
       if (bufferedDone) {
         bufferedDone = false;
-        finishStream();
+        if (drainingQueue || deltaQueue.length > 0) {
+          doneAfterDrain = true;
+        } else {
+          finishStream();
+        }
       }
     };
 
@@ -719,7 +787,7 @@ class OpenAICompatServer {
             bufferedDeltas.push(delta);
             return;
           }
-          writeDeltaChunk({ content: delta }, null);
+          enqueueDelta(delta);
         },
         onDone: () => {
           if (streamClosed || streamFinished) {
@@ -727,6 +795,10 @@ class OpenAICompatServer {
           }
           if (!streamOpened) {
             bufferedDone = true;
+            return;
+          }
+          if (drainingQueue || deltaQueue.length > 0) {
+            doneAfterDrain = true;
             return;
           }
           finishStream();
@@ -737,6 +809,10 @@ class OpenAICompatServer {
           }
           if (!streamOpened) {
             bufferedError = reason;
+            return;
+          }
+          if (drainingQueue || deltaQueue.length > 0) {
+            errorAfterDrain = reason;
             return;
           }
           failStream(reason);
@@ -870,7 +946,7 @@ function buildChannelContent(messages: OpenAIMessage[], stream: boolean) {
   lines.push("");
   if (stream) {
     lines.push(
-      "当前请求为 stream=true。请优先调用 channel_reply_stream 工具分段返回：可多次发送 delta，最后 done=true。若只返回一次，也可用 channel_reply。",
+      "当前请求为 stream=true。请优先调用 channel_reply_stream 工具分段返回：建议边生成边发送，单次 delta 尽量短（约 10-40 字），可多次发送，最后 done=true。若只返回一次，也可用 channel_reply。",
     );
   } else {
     lines.push("请直接给出你要返回给 API 调用方的最终回复内容。然后调用 channel_reply 工具，带上 request_id。");
@@ -915,6 +991,46 @@ function truncate(text: string, maxLength: number) {
     return text;
   }
   return `${text.slice(0, maxLength)} ...[truncated ${text.length - maxLength} chars]`;
+}
+
+function splitTextForStreaming(text: string, chunkSize: number) {
+  if (!text) {
+    return [];
+  }
+  if (!Number.isFinite(chunkSize) || chunkSize <= 0) {
+    return [text];
+  }
+
+  const size = Math.max(1, Math.floor(chunkSize));
+  const chars = Array.from(text);
+  const chunks: string[] = [];
+  for (let i = 0; i < chars.length; i += size) {
+    chunks.push(chars.slice(i, i + size).join(""));
+  }
+  return chunks;
+}
+
+function streamEmitChunkSize() {
+  if (!Number.isFinite(STREAM_EMIT_CHUNK_SIZE) || STREAM_EMIT_CHUNK_SIZE <= 0) {
+    return 0;
+  }
+  return Math.floor(STREAM_EMIT_CHUNK_SIZE);
+}
+
+function streamEmitIntervalMs() {
+  if (!Number.isFinite(STREAM_EMIT_INTERVAL_MS) || STREAM_EMIT_INTERVAL_MS < 0) {
+    return 0;
+  }
+  return Math.floor(STREAM_EMIT_INTERVAL_MS);
+}
+
+function sleep(ms: number) {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function sanitizeMeta(input: Record<string, string | undefined>) {
@@ -1004,6 +1120,8 @@ function getRuntimeStatus() {
     openai_api: {
       routes: ["/health", "/v1/models", "/v1/chat/completions"],
       models: MODEL_CATALOG,
+      stream_emit_chunk_size: streamEmitChunkSize(),
+      stream_emit_interval_ms: streamEmitIntervalMs(),
     },
     channel: {
       pending_requests: bridge.pendingCount(),
