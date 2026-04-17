@@ -90,6 +90,7 @@ bun run src/index.ts
 - `runtime_status`：查看 MCP 运行状态（含监听 host/port、listen_url、pending 请求数、OpenAI routes 和模型列表）
 - `channel_debug_events`：调试查看进入 channels 的消息内容和 meta（支持 `limit`）
 - `channel_reply`：Claude Code 用它回复某个 `request_id`
+- `channel_reply_stream`：流式回复工具（按 `request_id` 多次发送 `delta`，最后 `done=true`）
 - `channel_publish`：手动发送测试 channel
 
 ## HTTP API
@@ -116,6 +117,20 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "你好，介绍一下你是谁"}
+    ]
+  }'
+```
+
+### Chat Completions (stream)
+
+```bash
+curl -N -X POST http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-channel",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "请分三段介绍你自己"}
     ]
   }'
 ```

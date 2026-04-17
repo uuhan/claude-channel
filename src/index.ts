@@ -39,6 +39,12 @@ const ChannelReplySchema = z.object({
   content: z.string().min(1),
 });
 
+const ChannelReplyStreamSchema = z.object({
+  request_id: z.string().min(1),
+  delta: z.string().optional(),
+  done: z.boolean().optional(),
+});
+
 const ChannelPublishSchema = z.object({
   content: z.string().min(1),
   meta: z.record(z.string(), z.string()).optional(),
@@ -72,6 +78,14 @@ type PendingReply = {
   createdAt: number;
 };
 
+type PendingStreamReply = {
+  onDelta: (delta: string) => void;
+  onDone: () => void;
+  onError: (reason: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+  createdAt: number;
+};
+
 type OpenAIServerState = {
   running: boolean;
   host: string;
@@ -90,6 +104,7 @@ type ChannelEventRecord = {
 
 class ClaudeChannelBridge {
   private readonly pending = new Map<string, PendingReply>();
+  private readonly pendingStreams = new Map<string, PendingStreamReply>();
   private readonly channelEvents: ChannelEventRecord[] = [];
   private nextEventId = 1;
 
@@ -151,6 +166,79 @@ class ClaudeChannelBridge {
     return { requestId, content };
   }
 
+  async startStream(input: {
+    content: string;
+    meta?: Record<string, string>;
+    onDelta: (delta: string) => void;
+    onDone: () => void;
+    onError: (reason: Error) => void;
+  }): Promise<{ requestId: string }> {
+    const requestId = randomUUID();
+    const createdAt = Date.now();
+
+    const armTimeout = () =>
+      setTimeout(() => {
+        const pending = this.pendingStreams.get(requestId);
+        if (!pending) {
+          return;
+        }
+        this.pendingStreams.delete(requestId);
+        pending.onError(new Error(`Timed out waiting for Claude Code stream after ${this.timeoutMs}ms`));
+      }, this.timeoutMs);
+
+    let timeout = armTimeout();
+
+    const pendingStream: PendingStreamReply = {
+      createdAt,
+      timeout,
+      onDelta: (delta) => {
+        clearTimeout(timeout);
+        timeout = armTimeout();
+        pendingStream.timeout = timeout;
+        input.onDelta(delta);
+      },
+      onDone: () => {
+        clearTimeout(timeout);
+        this.pendingStreams.delete(requestId);
+        input.onDone();
+      },
+      onError: (reason) => {
+        clearTimeout(timeout);
+        this.pendingStreams.delete(requestId);
+        input.onError(reason);
+      },
+    };
+
+    this.pendingStreams.set(requestId, pendingStream);
+
+    const meta = sanitizeMeta({
+      source: "claude-channel",
+      request_id: requestId,
+      ...input.meta,
+    });
+    this.recordChannelEvent("request", input.content, meta);
+
+    try {
+      await this.server.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: input.content,
+          meta,
+        },
+      });
+    } catch (error) {
+      const pending = this.pendingStreams.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingStreams.delete(requestId);
+        pending.onError(new Error(`Failed to publish Claude channel notification: ${String(error)}`));
+      }
+      throw error;
+    }
+
+    return { requestId };
+  }
+
   async publish(input: { content: string; meta?: Record<string, string> }) {
     const meta = sanitizeMeta(input.meta || {});
     this.recordChannelEvent("publish", input.content, meta);
@@ -164,6 +252,18 @@ class ClaudeChannelBridge {
   }
 
   resolveReply(args: z.infer<typeof ChannelReplySchema>) {
+    const streamPending = this.pendingStreams.get(args.request_id);
+    if (streamPending) {
+      streamPending.onDelta(args.content);
+      streamPending.onDone();
+      return {
+        ok: true,
+        message: `Stream reply accepted for request_id=${args.request_id} via channel_reply fallback`,
+        mode: "stream_fallback",
+        latency_ms: Date.now() - streamPending.createdAt,
+      };
+    }
+
     const pending = this.pending.get(args.request_id);
     if (!pending) {
       return {
@@ -183,8 +283,46 @@ class ClaudeChannelBridge {
     };
   }
 
+  resolveStreamReply(args: z.infer<typeof ChannelReplyStreamSchema>) {
+    const pending = this.pendingStreams.get(args.request_id);
+    if (!pending) {
+      return {
+        ok: false,
+        message: `No pending stream request found for request_id=${args.request_id}`,
+      };
+    }
+
+    const hasDelta = typeof args.delta === "string" && args.delta.length > 0;
+    const done = args.done === true;
+    if (!hasDelta && !done) {
+      return {
+        ok: false,
+        message: "Either delta or done=true is required.",
+      };
+    }
+
+    if (hasDelta) {
+      pending.onDelta(args.delta || "");
+    }
+    if (done) {
+      pending.onDone();
+    }
+
+    return {
+      ok: true,
+      message: done
+        ? `Stream completed for request_id=${args.request_id}`
+        : `Stream delta accepted for request_id=${args.request_id}`,
+      done,
+    };
+  }
+
   pendingCount() {
     return this.pending.size;
+  }
+
+  pendingStreamCount() {
+    return this.pendingStreams.size;
   }
 
   getChannelEvents(limit?: number) {
@@ -196,6 +334,15 @@ class ClaudeChannelBridge {
 
   channelEventCount() {
     return this.channelEvents.length;
+  }
+
+  cancelStream(requestId: string, reason: string) {
+    const pending = this.pendingStreams.get(requestId);
+    if (!pending) {
+      return false;
+    }
+    pending.onError(new Error(reason));
+    return true;
   }
 
   private recordChannelEvent(
@@ -224,6 +371,12 @@ class ClaudeChannelBridge {
       clearTimeout(pending.timeout);
       pending.reject(new Error(reason));
       this.pending.delete(requestId);
+    }
+
+    for (const [requestId, pending] of this.pendingStreams.entries()) {
+      clearTimeout(pending.timeout);
+      pending.onError(new Error(reason));
+      this.pendingStreams.delete(requestId);
     }
   }
 }
@@ -395,7 +548,19 @@ class OpenAICompatServer {
     const request = parsed.value;
     const model = request.model || DEFAULT_MODEL_ID;
     const created = Math.floor(Date.now() / 1000);
-    const channelContent = buildChannelContent(request.messages);
+    const channelContent = buildChannelContent(request.messages, request.stream === true);
+
+    if (request.stream) {
+      await this.handleStreamChatCompletion({
+        req,
+        res,
+        request,
+        model,
+        created,
+        channelContent,
+      });
+      return;
+    }
 
     let bridgeResult: { requestId: string; content: string };
     try {
@@ -423,16 +588,6 @@ class OpenAICompatServer {
     }
 
     const completionId = `chatcmpl-${bridgeResult.requestId}`;
-    if (request.stream) {
-      sendStreamResponse(res, {
-        id: completionId,
-        model,
-        created,
-        content: bridgeResult.content,
-      });
-      return;
-    }
-
     sendJSON(res, 200, {
       id: completionId,
       object: "chat.completion",
@@ -454,6 +609,175 @@ class OpenAICompatServer {
         total_tokens: 0,
       },
     });
+  }
+
+  private async handleStreamChatCompletion(input: {
+    req: IncomingMessage;
+    res: ServerResponse<IncomingMessage>;
+    request: ChatCompletionRequest & { messages: OpenAIMessage[] };
+    model: string;
+    created: number;
+    channelContent: string;
+  }) {
+    const { req, res, request, model, created, channelContent } = input;
+    let completionId = `chatcmpl-${randomUUID()}`;
+    let streamRequestId = "";
+    let streamOpened = false;
+    let streamClosed = false;
+    let streamFinished = false;
+    const bufferedDeltas: string[] = [];
+    let bufferedDone = false;
+    let bufferedError: Error | null = null;
+
+    const writeDeltaChunk = (delta: Record<string, unknown>, finishReason: string | null) => {
+      if (streamClosed || streamFinished || res.writableEnded) {
+        return;
+      }
+      writeSSEData(res, {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            delta,
+            finish_reason: finishReason,
+          },
+        ],
+      });
+    };
+
+    const finishStream = () => {
+      if (streamFinished || streamClosed || res.writableEnded) {
+        return;
+      }
+      streamFinished = true;
+      writeDeltaChunk({}, "stop");
+      writeSSEDone(res);
+      res.end();
+    };
+
+    const failStream = (error: Error) => {
+      if (streamFinished || streamClosed || res.writableEnded) {
+        return;
+      }
+      streamFinished = true;
+      writeSSEData(res, {
+        error: {
+          type: error.message.includes("Timed out") ? "timeout_error" : "upstream_error",
+          message: error.message,
+          code: error.message.includes("Timed out")
+            ? "claude_reply_timeout"
+            : "claude_channel_error",
+        },
+      });
+      writeSSEDone(res);
+      res.end();
+    };
+
+    const flushBufferedEvents = () => {
+      if (!streamOpened || streamClosed || streamFinished || res.writableEnded) {
+        return;
+      }
+
+      while (bufferedDeltas.length > 0) {
+        const delta = bufferedDeltas.shift();
+        if (typeof delta === "string" && delta.length > 0) {
+          writeDeltaChunk({ content: delta }, null);
+        }
+      }
+
+      if (bufferedError) {
+        const error = bufferedError;
+        bufferedError = null;
+        failStream(error);
+        return;
+      }
+
+      if (bufferedDone) {
+        bufferedDone = false;
+        finishStream();
+      }
+    };
+
+    try {
+      const started = await this.bridge.startStream({
+        content: channelContent,
+        meta: sanitizeMeta({
+          source: "claude-channel",
+          request_type: "chat.completions",
+          model,
+          openai_user: request.user || "",
+          stream: "true",
+        }),
+        onDelta: (delta) => {
+          if (streamClosed || streamFinished) {
+            return;
+          }
+          if (!streamOpened) {
+            bufferedDeltas.push(delta);
+            return;
+          }
+          writeDeltaChunk({ content: delta }, null);
+        },
+        onDone: () => {
+          if (streamClosed || streamFinished) {
+            return;
+          }
+          if (!streamOpened) {
+            bufferedDone = true;
+            return;
+          }
+          finishStream();
+        },
+        onError: (reason) => {
+          if (streamClosed || streamFinished) {
+            return;
+          }
+          if (!streamOpened) {
+            bufferedError = reason;
+            return;
+          }
+          failStream(reason);
+        },
+      });
+      streamRequestId = started.requestId;
+      completionId = `chatcmpl-${streamRequestId}`;
+    } catch (error) {
+      const message = String(error);
+      sendJSON(res, 502, {
+        error: {
+          type: "upstream_error",
+          message,
+          code: "claude_channel_error",
+        },
+      });
+      return;
+    }
+
+    const handleClientClose = () => {
+      if (streamClosed) {
+        return;
+      }
+      streamClosed = true;
+      if (!streamFinished && streamRequestId) {
+        this.bridge.cancelStream(streamRequestId, "Client disconnected from streaming response.");
+      }
+    };
+
+    req.once("close", handleClientClose);
+    res.once("close", handleClientClose);
+
+    res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    streamOpened = true;
+
+    writeDeltaChunk({ role: "assistant" }, null);
+    flushBufferedEvents();
   }
 
   private checkApiKey(req: IncomingMessage, res: ServerResponse<IncomingMessage>) {
@@ -533,7 +857,7 @@ function parseChatCompletionRequest(input: unknown):
   };
 }
 
-function buildChannelContent(messages: OpenAIMessage[]) {
+function buildChannelContent(messages: OpenAIMessage[], stream: boolean) {
   const lines: string[] = [];
 
   lines.push("[OpenAI Chat Request]");
@@ -544,7 +868,13 @@ function buildChannelContent(messages: OpenAIMessage[]) {
     lines.push(`${role}${nameLabel}: ${text}`);
   }
   lines.push("");
-  lines.push("请直接给出你要返回给 API 调用方的最终回复内容。然后调用 channel_reply 工具，带上 request_id。");
+  if (stream) {
+    lines.push(
+      "当前请求为 stream=true。请优先调用 channel_reply_stream 工具分段返回：可多次发送 delta，最后 done=true。若只返回一次，也可用 channel_reply。",
+    );
+  } else {
+    lines.push("请直接给出你要返回给 API 调用方的最终回复内容。然后调用 channel_reply 工具，带上 request_id。");
+  }
 
   return lines.join("\n");
 }
@@ -605,51 +935,12 @@ function sendJSON(res: ServerResponse<IncomingMessage>, status: number, payload:
   res.end(JSON.stringify(payload));
 }
 
-function sendStreamResponse(
-  res: ServerResponse<IncomingMessage>,
-  input: { id: string; model: string; created: number; content: string },
-) {
-  res.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
+function writeSSEData(res: ServerResponse<IncomingMessage>, payload: unknown) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
 
-  const chunk = {
-    id: input.id,
-    object: "chat.completion.chunk",
-    created: input.created,
-    model: input.model,
-    choices: [
-      {
-        index: 0,
-        delta: {
-          role: "assistant",
-          content: input.content,
-        },
-        finish_reason: null,
-      },
-    ],
-  };
-
-  const doneChunk = {
-    id: input.id,
-    object: "chat.completion.chunk",
-    created: input.created,
-    model: input.model,
-    choices: [
-      {
-        index: 0,
-        delta: {},
-        finish_reason: "stop",
-      },
-    ],
-  };
-
-  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-  res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
+function writeSSEDone(res: ServerResponse<IncomingMessage>) {
   res.write("data: [DONE]\n\n");
-  res.end();
 }
 
 async function readJSONBody(req: IncomingMessage, maxBytes: number) {
@@ -687,6 +978,7 @@ const server = new MCPServer(
     instructions:
       'OpenAI 请求会通过 <channel source="claude-channel" request_id="..."> 发送到会话。' +
       "你需要基于 channel 内容生成回复，并调用 channel_reply 工具把文本返回给桥接服务。" +
+      "当请求为 stream=true 时，可多次调用 channel_reply_stream 返回分段 delta，并在结束时 done=true。" +
       "如果要手动发送测试 channel，可用 channel_publish。",
   },
 );
@@ -715,6 +1007,7 @@ function getRuntimeStatus() {
     },
     channel: {
       pending_requests: bridge.pendingCount(),
+      pending_stream_requests: bridge.pendingStreamCount(),
       total_events: bridge.channelEventCount(),
       max_events: Number.isFinite(CHANNEL_DEBUG_MAX_EVENTS) && CHANNEL_DEBUG_MAX_EVENTS > 0
         ? CHANNEL_DEBUG_MAX_EVENTS
@@ -796,6 +1089,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           content: { type: "string" },
         },
         required: ["request_id", "content"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "channel_reply_stream",
+      description:
+        "Reply to one pending stream request by request_id. Can be called multiple times with delta, and done=true to finish.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          request_id: { type: "string" },
+          delta: { type: "string" },
+          done: { type: "boolean" },
+        },
+        required: ["request_id"],
         additionalProperties: false,
       },
     },
@@ -899,6 +1207,21 @@ server.setRequestHandler(
     if (name === "channel_reply") {
       const args = ChannelReplySchema.parse(request.params.arguments ?? {});
       const result = bridge.resolveReply(args);
+      return {
+        content: [
+          {
+            type: "text",
+            text: result.message,
+          },
+        ],
+        structuredContent: result,
+        isError: !result.ok,
+      };
+    }
+
+    if (name === "channel_reply_stream") {
+      const args = ChannelReplyStreamSchema.parse(request.params.arguments ?? {});
+      const result = bridge.resolveStreamReply(args);
       return {
         content: [
           {
