@@ -53,9 +53,25 @@ const ChannelPublishSchema = z.object({
   meta: z.record(z.string(), z.string()).optional(),
 });
 
+const CHANNEL_EVENT_KINDS = [
+  "request",
+  "publish",
+  "reply",
+  "stream_delta",
+  "stream_done",
+  "response",
+  "response_chunk",
+  "response_done",
+  "response_error",
+] as const;
+
 const ChannelDebugEventsSchema = z
   .object({
     limit: z.number().int().min(1).max(500).optional(),
+    request_id: z.string().min(1).optional(),
+    kind: z.enum(CHANNEL_EVENT_KINDS).optional(),
+    source_type: z.string().min(1).optional(),
+    stream: z.boolean().optional(),
   })
   .optional();
 
@@ -97,12 +113,20 @@ type OpenAIServerState = {
   api_key_enabled: boolean;
 };
 
+type ChannelEventKind = (typeof CHANNEL_EVENT_KINDS)[number];
+
+type ChannelEventSourceRecord = {
+  type: string;
+  input: Record<string, unknown>;
+};
+
 type ChannelEventRecord = {
   event_id: number;
   ts: string;
-  kind: "request" | "publish";
+  kind: ChannelEventKind;
   content: string;
   meta: Record<string, string>;
+  source?: ChannelEventSourceRecord;
 };
 
 class ClaudeChannelBridge {
@@ -123,6 +147,7 @@ class ClaudeChannelBridge {
   async sendAndWait(input: {
     content: string;
     meta?: Record<string, string>;
+    debugSource?: ChannelEventSourceRecord;
   }): Promise<{ requestId: string; content: string }> {
     const requestId = randomUUID();
 
@@ -145,7 +170,7 @@ class ClaudeChannelBridge {
       request_id: requestId,
       ...input.meta,
     });
-    this.recordChannelEvent("request", input.content, meta);
+    this.recordChannelEvent("request", input.content, meta, input.debugSource);
 
     try {
       await this.server.notification({
@@ -172,6 +197,7 @@ class ClaudeChannelBridge {
   async startStream(input: {
     content: string;
     meta?: Record<string, string>;
+    debugSource?: ChannelEventSourceRecord;
     onDelta: (delta: string) => void;
     onDone: () => void;
     onError: (reason: Error) => void;
@@ -219,7 +245,7 @@ class ClaudeChannelBridge {
       request_id: requestId,
       ...input.meta,
     });
-    this.recordChannelEvent("request", input.content, meta);
+    this.recordChannelEvent("request", input.content, meta, input.debugSource);
 
     try {
       await this.server.notification({
@@ -242,9 +268,13 @@ class ClaudeChannelBridge {
     return { requestId };
   }
 
-  async publish(input: { content: string; meta?: Record<string, string> }) {
+  async publish(input: {
+    content: string;
+    meta?: Record<string, string>;
+    debugSource?: ChannelEventSourceRecord;
+  }) {
     const meta = sanitizeMeta(input.meta || {});
-    this.recordChannelEvent("publish", input.content, meta);
+    this.recordChannelEvent("publish", input.content, meta, input.debugSource);
     await this.server.notification({
       method: "notifications/claude/channel",
       params: {
@@ -257,6 +287,23 @@ class ClaudeChannelBridge {
   resolveReply(args: z.infer<typeof ChannelReplySchema>) {
     const streamPending = this.pendingStreams.get(args.request_id);
     if (streamPending) {
+      this.logDebugEvent({
+        kind: "reply",
+        content: args.content,
+        meta: {
+          request_id: args.request_id,
+          stream: "true",
+          mode: "stream_fallback",
+        },
+        source: {
+          type: "mcp.tool.channel_reply",
+          input: {
+            request_id: args.request_id,
+            content: truncate(args.content, 12000),
+            mode: "stream_fallback",
+          },
+        },
+      });
       streamPending.onDelta(args.content);
       streamPending.onDone();
       return {
@@ -275,6 +322,23 @@ class ClaudeChannelBridge {
       };
     }
 
+    this.logDebugEvent({
+      kind: "reply",
+      content: args.content,
+      meta: {
+        request_id: args.request_id,
+        stream: "false",
+        mode: "final",
+      },
+      source: {
+        type: "mcp.tool.channel_reply",
+        input: {
+          request_id: args.request_id,
+          content: truncate(args.content, 12000),
+          mode: "final",
+        },
+      },
+    });
     clearTimeout(pending.timeout);
     this.pending.delete(args.request_id);
     pending.resolve(args.content);
@@ -305,9 +369,40 @@ class ClaudeChannelBridge {
     }
 
     if (hasDelta) {
+      this.logDebugEvent({
+        kind: "stream_delta",
+        content: args.delta || "",
+        meta: {
+          request_id: args.request_id,
+          stream: "true",
+        },
+        source: {
+          type: "mcp.tool.channel_reply_stream",
+          input: {
+            request_id: args.request_id,
+            delta: truncate(args.delta || "", 12000),
+            done,
+          },
+        },
+      });
       pending.onDelta(args.delta || "");
     }
     if (done) {
+      this.logDebugEvent({
+        kind: "stream_done",
+        content: "[DONE]",
+        meta: {
+          request_id: args.request_id,
+          stream: "true",
+        },
+        source: {
+          type: "mcp.tool.channel_reply_stream",
+          input: {
+            request_id: args.request_id,
+            done: true,
+          },
+        },
+      });
       pending.onDone();
     }
 
@@ -328,11 +423,30 @@ class ClaudeChannelBridge {
     return this.pendingStreams.size;
   }
 
-  getChannelEvents(limit?: number) {
-    if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) {
-      return [...this.channelEvents];
+  getChannelEvents(filters?: z.infer<typeof ChannelDebugEventsSchema>) {
+    let events = [...this.channelEvents];
+
+    if (filters?.request_id) {
+      events = events.filter((event) => event.meta.request_id === filters.request_id);
     }
-    return this.channelEvents.slice(-Math.floor(limit));
+
+    if (filters?.kind) {
+      events = events.filter((event) => event.kind === filters.kind);
+    }
+
+    if (filters?.source_type) {
+      events = events.filter((event) => event.source?.type === filters.source_type);
+    }
+
+    if (typeof filters?.stream === "boolean") {
+      events = events.filter((event) => event.meta.stream === String(filters.stream));
+    }
+
+    if (typeof filters?.limit !== "number" || !Number.isFinite(filters.limit) || filters.limit <= 0) {
+      return events;
+    }
+
+    return events.slice(-Math.floor(filters.limit));
   }
 
   channelEventCount() {
@@ -348,10 +462,25 @@ class ClaudeChannelBridge {
     return true;
   }
 
+  logDebugEvent(input: {
+    kind: ChannelEventKind;
+    content: string;
+    meta?: Record<string, string>;
+    source?: ChannelEventSourceRecord;
+  }) {
+    this.recordChannelEvent(
+      input.kind,
+      input.content,
+      sanitizeMeta(input.meta || {}),
+      input.source,
+    );
+  }
+
   private recordChannelEvent(
-    kind: ChannelEventRecord["kind"],
+    kind: ChannelEventKind,
     content: string,
     meta: Record<string, string>,
+    source?: ChannelEventSourceRecord,
   ) {
     this.channelEvents.push({
       event_id: this.nextEventId++,
@@ -359,6 +488,7 @@ class ClaudeChannelBridge {
       kind,
       content,
       meta,
+      source,
     });
 
     const maxEvents = Number.isFinite(CHANNEL_DEBUG_MAX_EVENTS) && CHANNEL_DEBUG_MAX_EVENTS > 0
@@ -552,6 +682,7 @@ class OpenAICompatServer {
     const model = request.model || DEFAULT_MODEL_ID;
     const created = Math.floor(Date.now() / 1000);
     const channelContent = buildChannelContent(request.messages, request.stream === true);
+    const debugSource = buildChatCompletionDebugSource(req, request, model);
 
     if (request.stream) {
       await this.handleStreamChatCompletion({
@@ -561,6 +692,7 @@ class OpenAICompatServer {
         model,
         created,
         channelContent,
+        debugSource,
       });
       return;
     }
@@ -576,6 +708,7 @@ class OpenAICompatServer {
           openai_user: request.user || "",
           stream: String(Boolean(request.stream)),
         }),
+        debugSource,
       });
     } catch (error) {
       const message = String(error);
@@ -591,7 +724,7 @@ class OpenAICompatServer {
     }
 
     const completionId = `chatcmpl-${bridgeResult.requestId}`;
-    sendJSON(res, 200, {
+    const responsePayload = {
       id: completionId,
       object: "chat.completion",
       created,
@@ -611,7 +744,25 @@ class OpenAICompatServer {
         completion_tokens: 0,
         total_tokens: 0,
       },
+    };
+    this.bridge.logDebugEvent({
+      kind: "response",
+      content: bridgeResult.content,
+      meta: {
+        request_id: bridgeResult.requestId,
+        stream: "false",
+        status: "200",
+        model,
+      },
+      source: {
+        type: "openai.http.response",
+        input: {
+          request_id: bridgeResult.requestId,
+          payload: cloneDebugValue(responsePayload),
+        },
+      },
     });
+    sendJSON(res, 200, responsePayload);
   }
 
   private async handleStreamChatCompletion(input: {
@@ -621,8 +772,9 @@ class OpenAICompatServer {
     model: string;
     created: number;
     channelContent: string;
+    debugSource: ChannelEventSourceRecord;
   }) {
-    const { req, res, request, model, created, channelContent } = input;
+    const { req, res, request, model, created, channelContent, debugSource } = input;
     let completionId = `chatcmpl-${randomUUID()}`;
     let streamRequestId = "";
     let streamOpened = false;
@@ -639,11 +791,14 @@ class OpenAICompatServer {
     const emitIntervalMs = streamEmitIntervalMs();
     const punctPauseMs = streamEmitPunctPauseMs();
 
-    const writeDeltaChunk = (delta: Record<string, unknown>, finishReason: string | null) => {
+    const writeDeltaChunk = async (
+      delta: Record<string, unknown>,
+      finishReason: string | null,
+    ) => {
       if (streamClosed || streamFinished || res.writableEnded) {
         return;
       }
-      writeSSEData(res, {
+      const payload = {
         id: completionId,
         object: "chat.completion.chunk",
         created,
@@ -655,25 +810,91 @@ class OpenAICompatServer {
             finish_reason: finishReason,
           },
         ],
+      };
+      await writeSSEData(res, payload);
+      this.bridge.logDebugEvent({
+        kind: "response_chunk",
+        content: summarizeResponseChunk(delta),
+        meta: {
+          request_id: streamRequestId,
+          stream: "true",
+          status: "200",
+          model,
+          finish_reason: finishReason || "",
+        },
+        source: {
+          type: "openai.http.sse.chunk",
+          input: {
+            request_id: streamRequestId,
+            payload: cloneDebugValue(payload),
+          },
+        },
       });
     };
 
-    const finishStream = () => {
+    const finishStream = async () => {
       if (streamFinished || streamClosed || res.writableEnded) {
         return;
       }
       streamFinished = true;
-      writeDeltaChunk({}, "stop");
-      writeSSEDone(res);
+      const payload = {
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "stop",
+          },
+        ],
+      };
+      await writeSSEData(res, payload);
+      this.bridge.logDebugEvent({
+        kind: "response_chunk",
+        content: "[stop]",
+        meta: {
+          request_id: streamRequestId,
+          stream: "true",
+          status: "200",
+          model,
+          finish_reason: "stop",
+        },
+        source: {
+          type: "openai.http.sse.chunk",
+          input: {
+            request_id: streamRequestId,
+            payload: cloneDebugValue(payload),
+          },
+        },
+      });
+      await writeSSEDone(res);
+      this.bridge.logDebugEvent({
+        kind: "response_done",
+        content: "[DONE]",
+        meta: {
+          request_id: streamRequestId,
+          stream: "true",
+          status: "200",
+          model,
+        },
+        source: {
+          type: "openai.http.sse.done",
+          input: {
+            request_id: streamRequestId,
+          },
+        },
+      });
       res.end();
     };
 
-    const failStream = (error: Error) => {
+    const failStream = async (error: Error) => {
       if (streamFinished || streamClosed || res.writableEnded) {
         return;
       }
       streamFinished = true;
-      writeSSEData(res, {
+      const payload = {
         error: {
           type: error.message.includes("Timed out") ? "timeout_error" : "upstream_error",
           message: error.message,
@@ -681,8 +902,43 @@ class OpenAICompatServer {
             ? "claude_reply_timeout"
             : "claude_channel_error",
         },
+      };
+      await writeSSEData(res, payload);
+      this.bridge.logDebugEvent({
+        kind: "response_error",
+        content: error.message,
+        meta: {
+          request_id: streamRequestId,
+          stream: "true",
+          status: error.message.includes("Timed out") ? "504" : "502",
+          model,
+        },
+        source: {
+          type: "openai.http.sse.error",
+          input: {
+            request_id: streamRequestId,
+            payload: cloneDebugValue(payload),
+          },
+        },
       });
-      writeSSEDone(res);
+      await writeSSEDone(res);
+      this.bridge.logDebugEvent({
+        kind: "response_done",
+        content: "[DONE]",
+        meta: {
+          request_id: streamRequestId,
+          stream: "true",
+          status: error.message.includes("Timed out") ? "504" : "502",
+          model,
+        },
+        source: {
+          type: "openai.http.sse.done",
+          input: {
+            request_id: streamRequestId,
+            after_error: true,
+          },
+        },
+      });
       res.end();
     };
 
@@ -712,7 +968,7 @@ class OpenAICompatServer {
           if (!delta) {
             continue;
           }
-          writeDeltaChunk({ content: delta }, null);
+          await writeDeltaChunk({ content: delta }, null);
           const delayMs = emitIntervalMs + streamChunkExtraPause(delta, punctPauseMs);
           if (delayMs > 0) {
             await sleep(delayMs);
@@ -729,17 +985,17 @@ class OpenAICompatServer {
       if (errorAfterDrain) {
         const error = errorAfterDrain;
         errorAfterDrain = null;
-        failStream(error);
+        await failStream(error);
         return;
       }
 
       if (doneAfterDrain) {
         doneAfterDrain = false;
-        finishStream();
+        await finishStream();
       }
     };
 
-    const flushBufferedEvents = () => {
+    const flushBufferedEvents = async () => {
       if (!streamOpened || streamClosed || streamFinished || res.writableEnded) {
         return;
       }
@@ -757,7 +1013,7 @@ class OpenAICompatServer {
         if (drainingQueue || deltaQueue.length > 0) {
           errorAfterDrain = error;
         } else {
-          failStream(error);
+          await failStream(error);
         }
         return;
       }
@@ -767,7 +1023,7 @@ class OpenAICompatServer {
         if (drainingQueue || deltaQueue.length > 0) {
           doneAfterDrain = true;
         } else {
-          finishStream();
+          await finishStream();
         }
       }
     };
@@ -782,6 +1038,7 @@ class OpenAICompatServer {
           openai_user: request.user || "",
           stream: "true",
         }),
+        debugSource,
         onDelta: (delta) => {
           if (streamClosed || streamFinished) {
             return;
@@ -804,7 +1061,7 @@ class OpenAICompatServer {
             doneAfterDrain = true;
             return;
           }
-          finishStream();
+          void finishStream();
         },
         onError: (reason) => {
           if (streamClosed || streamFinished) {
@@ -818,7 +1075,7 @@ class OpenAICompatServer {
             errorAfterDrain = reason;
             return;
           }
-          failStream(reason);
+          void failStream(reason);
         },
       });
       streamRequestId = started.requestId;
@@ -845,7 +1102,6 @@ class OpenAICompatServer {
       }
     };
 
-    req.once("close", handleClientClose);
     res.once("close", handleClientClose);
 
     res.writeHead(200, {
@@ -855,8 +1111,8 @@ class OpenAICompatServer {
     });
     streamOpened = true;
 
-    writeDeltaChunk({ role: "assistant" }, null);
-    flushBufferedEvents();
+    await writeDeltaChunk({ role: "assistant" }, null);
+    await flushBufferedEvents();
   }
 
   private checkApiKey(req: IncomingMessage, res: ServerResponse<IncomingMessage>) {
@@ -958,6 +1214,98 @@ function buildChannelContent(messages: OpenAIMessage[], stream: boolean) {
   return lines.join("\n");
 }
 
+function buildChatCompletionDebugSource(
+  req: IncomingMessage,
+  request: ChatCompletionRequest & { messages: OpenAIMessage[] },
+  model: string,
+): ChannelEventSourceRecord {
+  return {
+    type: "openai.chat.completions",
+    input: {
+      http: {
+        method: req.method || "POST",
+        path: req.url || "/v1/chat/completions",
+        remote_address: req.socket.remoteAddress || "",
+        headers: selectDebugHeaders(req.headers),
+      },
+      request: {
+        model,
+        user: request.user || "",
+        stream: request.stream === true,
+        message_count: request.messages.length,
+        messages: request.messages.map((message) => ({
+          role: message.role,
+          name: message.name || "",
+          content: cloneDebugValue(message.content),
+        })),
+      },
+    },
+  };
+}
+
+function selectDebugHeaders(headers: IncomingMessage["headers"]) {
+  const selected = [
+    "content-type",
+    "accept",
+    "user-agent",
+    "x-forwarded-for",
+    "x-real-ip",
+    "origin",
+    "referer",
+  ] as const;
+  const result: Record<string, string | string[]> = {};
+  for (const key of selected) {
+    const value = headers[key];
+    if (typeof value === "undefined") {
+      continue;
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
+function cloneDebugValue(value: unknown, depth = 0): unknown {
+  if (depth >= 6) {
+    return "[max_depth]";
+  }
+
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "number" ||
+    typeof value === "bigint"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return truncate(value, 12000);
+  }
+
+  if (Array.isArray(value)) {
+    const items = value.slice(0, 100).map((item) => cloneDebugValue(item, depth + 1));
+    if (value.length > 100) {
+      items.push({ __truncated_items__: value.length - 100 });
+    }
+    return items;
+  }
+
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (const [index, [key, entryValue]] of entries.entries()) {
+      if (index >= 100) {
+        result.__truncated_keys__ = entries.length - 100;
+        break;
+      }
+      result[key] = cloneDebugValue(entryValue, depth + 1);
+    }
+    return result;
+  }
+
+  return String(value);
+}
+
 function normalizeContent(content: unknown): string {
   if (typeof content === "string") {
     return truncate(content, 5000);
@@ -987,6 +1335,20 @@ function normalizeContent(content: unknown): string {
   }
 
   return truncate(JSON.stringify(content), 5000);
+}
+
+function summarizeResponseChunk(delta: Record<string, unknown>) {
+  const content = delta.content;
+  if (typeof content === "string" && content.length > 0) {
+    return content;
+  }
+
+  const role = delta.role;
+  if (typeof role === "string" && role.length > 0) {
+    return `[role:${role}]`;
+  }
+
+  return truncate(JSON.stringify(delta), 2000);
 }
 
 function truncate(text: string, maxLength: number) {
@@ -1086,12 +1448,43 @@ function sendJSON(res: ServerResponse<IncomingMessage>, status: number, payload:
   res.end(JSON.stringify(payload));
 }
 
-function writeSSEData(res: ServerResponse<IncomingMessage>, payload: unknown) {
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+async function writeSSEData(res: ServerResponse<IncomingMessage>, payload: unknown) {
+  await writeResponseChunk(res, `data: ${JSON.stringify(payload)}\n\n`);
 }
 
-function writeSSEDone(res: ServerResponse<IncomingMessage>) {
-  res.write("data: [DONE]\n\n");
+async function writeSSEDone(res: ServerResponse<IncomingMessage>) {
+  await writeResponseChunk(res, "data: [DONE]\n\n");
+}
+
+async function writeResponseChunk(res: ServerResponse<IncomingMessage>, chunk: string) {
+  if (res.writableEnded || res.destroyed) {
+    return;
+  }
+
+  const accepted = res.write(chunk);
+  if (accepted) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const cleanup = () => {
+      res.off("close", handleClose);
+      res.off("drain", handleDrain);
+    };
+
+    const handleClose = () => {
+      cleanup();
+      resolve();
+    };
+
+    const handleDrain = () => {
+      cleanup();
+      resolve();
+    };
+
+    res.once("close", handleClose);
+    res.once("drain", handleDrain);
+  });
 }
 
 async function readJSONBody(req: IncomingMessage, maxBytes: number) {
@@ -1219,7 +1612,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "channel_debug_events",
-      description: "Debug tool: list channel messages that were sent into Claude channels.",
+      description:
+        "Debug tool: inspect channel input/output events and OpenAI response output, including detailed source snapshots.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1228,6 +1622,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             minimum: 1,
             maximum: 500,
             description: "Optional max number of latest events to return.",
+          },
+          request_id: {
+            type: "string",
+            description: "Optional exact request_id filter.",
+          },
+          kind: {
+            type: "string",
+            enum: [...CHANNEL_EVENT_KINDS],
+            description: "Optional event kind filter.",
+          },
+          source_type: {
+            type: "string",
+            description: "Optional exact source.type filter, e.g. openai.chat.completions.",
+          },
+          stream: {
+            type: "boolean",
+            description: "Optional stream=true/false filter based on original request.",
           },
         },
         additionalProperties: false,
@@ -1340,10 +1751,18 @@ server.setRequestHandler(
 
     if (name === "channel_debug_events") {
       const args = ChannelDebugEventsSchema.parse(request.params.arguments);
-      const events = bridge.getChannelEvents(args?.limit);
+      const events = bridge.getChannelEvents(args);
       const result = {
         count: events.length,
         pending_requests: bridge.pendingCount(),
+        pending_stream_requests: bridge.pendingStreamCount(),
+        filters: {
+          limit: args?.limit,
+          request_id: args?.request_id,
+          kind: args?.kind,
+          source_type: args?.source_type,
+          stream: args?.stream,
+        },
         events,
       };
 
@@ -1395,6 +1814,13 @@ server.setRequestHandler(
         meta: {
           source: "manual",
           ...(args.meta || {}),
+        },
+        debugSource: {
+          type: "mcp.tool.channel_publish",
+          input: {
+            meta: args.meta || {},
+            content: truncate(args.content, 12000),
+          },
         },
       });
       return {
