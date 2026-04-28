@@ -97,7 +97,7 @@ class ClaudeChannelBridge {
   constructor(
     private readonly server: MCPServer,
     private timeoutMs: number,
-  ) {}
+  ) { }
 
   setTimeoutMs(timeoutMs: number) {
     this.timeoutMs = timeoutMs;
@@ -482,7 +482,7 @@ class OpenAICompatServer {
   private apiKey = config.apiKey;
   private timeoutMs = config.chatTimeoutMs;
 
-  constructor(private readonly bridge: ClaudeChannelBridge) {}
+  constructor(private readonly bridge: ClaudeChannelBridge) { }
 
   getState(): OpenAIServerState {
     return {
@@ -1051,7 +1051,6 @@ function buildModelListResponse() {
 
 function buildChannelContent(messages: OpenAIMessage[], stream: boolean) {
   const lines: string[] = [];
-  lines.push("[OpenAI Chat Request]");
   for (const msg of messages) {
     const role = msg.role.toUpperCase();
     const text = normalizeContent(msg.content, config.maxMessageChars);
